@@ -258,7 +258,7 @@ def eigs_cis(
         return _region, eigvals, eigvecs
 
     # perform eigendecomposition for each region independently
-    eigdecomp_results = map(_each, view_df.values)
+    eigdecomp_results = map(_each, view_df.itertuples(index=False))
 
     # Prepare output table for eigen vectors by adding columns to bins-table
     bins = clr.bins()[:]
