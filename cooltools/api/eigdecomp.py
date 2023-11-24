@@ -29,26 +29,26 @@ def _correlate_with_eigs(eigvecs, phasing_vector, metric="spearmanr"):
         Correlation coefficients.
     """
     corrs = []
+    # iterate over columns
+    for eigvec in eigvecs.T:
 
-    for i in range(eigvecs.shape[1]):
-
-        mask = np.isfinite(eigvecs[:, i]) & np.isfinite(phasing_vector)
+        mask = np.isfinite(eigvec) & np.isfinite(phasing_vector)
 
         if metric is None or metric == "spearmanr":
-            corr = scipy.stats.spearmanr(phasing_vector[mask], eigvecs[mask, i])[0]
+            corr = scipy.stats.spearmanr(phasing_vector[mask], eigvec[mask])[0]
         elif metric == "pearsonr":
-            corr = scipy.stats.pearsonr(phasing_vector[mask], eigvecs[mask, i])[0]
+            corr = scipy.stats.pearsonr(phasing_vector[mask], eigvec[mask])[0]
         elif metric == "var_explained":
-            corr = scipy.stats.pearsonr(phasing_vector[mask], eigvecs[mask, i])[0]
+            corr = scipy.stats.pearsonr(phasing_vector[mask], eigvec[mask])[0]
             # multiply by the sign to keep the phasing information
-            corr = np.sign(corr) * corr * corr * np.var(eigvecs[mask, i])
+            corr = np.sign(corr) * corr * corr * np.var(eigvec[mask])
         elif metric == "MAD_explained":
             corr = (
-                numutils.COMED(phasing_vector[mask], eigvecs[mask, i]) *
-                numutils.MAD(eigvecs[mask, i])
+                numutils.COMED(phasing_vector[mask], eigvec[mask]) *
+                numutils.MAD(eigvec[mask])
             )
         else:
-            raise ValueError("Unknown correlation metric: {}".format(metric))
+            raise ValueError(f"Unknown correlation metric: {metric}")
 
         corrs.append(corr)
 
@@ -214,8 +214,6 @@ def eigs_cis(
         else ignore_diags
     )
 
-    bins = clr.bins()[:]
-
     # Adjust phasing track as necessary
     if phasing_track is not None:
         phasing_track = align_track_with_cooler(
@@ -224,32 +222,18 @@ def eigs_cis(
             view_df=view_df,
             clr_weight_name=clr_weight_name,
             mask_clr_bad_bins=True,
-            drop_track_na=True # this adds check for chromosomes that have all missing values
+            drop_track_na=True  # this adds check for chromosomes that have all missing values
         )
 
-    # Prepare output table for eigen vectors
-    eigvec_table = bioframe.assign_view(bins, view_df).dropna(subset=["view_region"], axis=0)
-    eigvec_table = eigvec_table.loc[:, bins.columns]
-    eigvec_columns = [f"E{i + 1}" for i in range(n_eigs)]
-    for ev_col in eigvec_columns:
-        eigvec_table[ev_col] = np.nan
-
-    # Prepare output table for eigenvalues
-    eigvals_table = view_df.copy()
-    eigval_columns = [f"eigval{i + 1}" for i in range(n_eigs)]
-    for eval_col in eigval_columns:
-        eigvals_table[eval_col] = np.nan
-
-    # Eigendecompose matrix per region (can be multiprocessed).
-    # Output assumes that the order of results matches regions.
+    # Eigendecompose matrix per region (can be multiprocessed)
     def _each(region):
         _region = region[:3]  # take only (chrom, start, end)
         A = clr.matrix(balance=clr_weight_name).fetch(_region)
 
         OE = _obsexp_cis_dense(A, ignore_diags, clip_percentile)
         if OE is None:
-            eigvals = np.array([np.nan for i in range(n_eigs)])
-            eigvecs = np.array([np.ones(A.shape[0]) * np.nan for i in range(n_eigs)])
+            eigvals = np.full(shape=n_eigs, fill_value=np.nan)
+            eigvecs = np.full(shape=(n_eigs, len(A)), fill_value=np.nan)
         else:
             eigvecs, eigvals = numutils.get_eig(OE, n_eigs, mask_zero_rows=True)
             eigvecs /= np.sqrt(np.nansum(eigvecs ** 2, axis=1))[:, None]
@@ -258,7 +242,7 @@ def eigs_cis(
             if phasing_track is not None:
                 # Extract phasing track relevant for the _region
                 phasing_track_region = bioframe.select(phasing_track, _region)
-                phasing_vector = phasing_track_region["value"].values
+                phasing_vector = phasing_track_region["value"].to_numpy()
                 corrs = _correlate_with_eigs(
                     eigvecs, phasing_vector, corr_metric
                 )
@@ -273,12 +257,25 @@ def eigs_cis(
 
         return _region, eigvals, eigvecs
 
-    results = map(_each, view_df.values)
+    # perform eigendecomposition for each region independently
+    eigdecomp_results = map(_each, view_df.values)
 
+    # Prepare output table for eigen vectors by adding columns to bins-table
+    bins = clr.bins()[:]
+    eigvec_columns = [f"E{i + 1}" for i in range(n_eigs)]
+    eigvec_table = bins.reindex(columns=bins.columns[:3] + eigvec_columns)
+    eigvec_table = bioframe.assign_view(eigvec_table, view_df).dropna(subset=["view_region"], axis=0)
+
+    # Prepare output table for eigenvalues by adding columns to view_df-table
+    eigval_columns = [f"eigval{i + 1}" for i in range(n_eigs)]
+    eigvals_table = view_df.reindex(columns=view_df.columns + eigval_columns)
+    
     # Go through eigendecomposition results and fill in output tables.
-    for _region, _eigvals, _eigvecs in results:
+    for _region, _eigvals, _eigvecs in eigdecomp_results:
+        # fill in eigvec_table with the eigenvectors for a given region
         idx = bioframe.select(eigvec_table, _region).index
         eigvec_table.loc[idx, eigvec_columns] = _eigvecs.T
+        # fill in eigval_table with the eigenvalues for a given region
         idx = bioframe.select(eigvals_table, _region).index
         eigvals_table.loc[idx, eigval_columns] = _eigvals
 
@@ -482,7 +479,7 @@ def eigs_trans(
             mask_clr_bad_bins=True,
             drop_track_na=True  # this adds check for chromosomes that have all missing values
         )
-        phasing_vector = phasing_track["value"].values[lo:hi]
+        phasing_vector = phasing_track["value"].to_numpy()[lo:hi]
 
     OE = _obsexp_trans_dense(A, partition, perc_top, perc_bottom)
 
@@ -503,13 +500,13 @@ def eigs_trans(
             eigvals = eigvals[idx]
             eigvecs[idx] = eigvecs[idx]
 
-    eigvec_table = bins.copy()
-    for i, eigvec in enumerate(eigvecs):
-        eigvec_table[f"E{i + 1}"] = eigvec
+    # prepare bins-like table to store eigenvectors and fill it
+    eigvec_columns = [f"E{i + 1}" for i in range(n_eigs)]
+    eigvec_table = bins.reindex(columns=bins.columns[:3] + eigvec_columns)
+    eigvec_table[eigvec_columns] = eigvecs.T
 
-    eigvals_table = pd.DataFrame(
-        data=np.atleast_2d(eigvals),
-        columns=[f"eigval{i + 1}" for i in range(n_eigs)],
-    )
+    # prepare table (single row) to store eigenvalues in columns and fill it
+    eigval_columns = [f"eigval{i + 1}" for i in range(n_eigs)]
+    eigvals_table = pd.DataFrame( np.atleast_2d(eigvals), columns=eigval_columns )    
 
     return eigvals_table, eigvec_table
